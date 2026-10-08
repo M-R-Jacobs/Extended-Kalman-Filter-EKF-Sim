@@ -1,0 +1,185 @@
+# 0. Library imports
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import chi2    # chi-square distribution, for the NEES/NIS acceptance bounds
+
+plt.rcParams["font.family"] = "Arial"
+
+
+
+# 1. Problem setup (Bar-Shalom, Li & Kirubarajan)
+
+DT = 1.0            # time step (s)
+N_STEPS = 100       # steps per run
+N_RUNS = 50         # Monte Carlo runs, needed for averaged NEES/NIS (one run is too noisy to judge)
+H_SENSOR = 20.0     # sensor height above the track (m)
+
+Q_SPECTRAL = 0.01   # process noise intensity (m^2/s^3) - random acceleration "jitter" on the cart
+SIGMA_R = 1.0       # range measurement noise, 1-sigma (m)
+
+X0_TRUE = np.array([50.0, 2.0])     # true initial state: 50 m out, moving away at 2 m/s
+P0 = np.diag([10.0**2, 1.0**2])     # initial uncertainty: 10 m in position, 1 m/s in velocity
+
+N_STATE = 2     # length of state vector
+N_MEAS = 1      # length of measurement vector
+
+F = np.array([
+    [1.0, DT],
+    [0.0, 1.0]
+])
+    # constant-velocity dynamics: x_new = x + v*dt, v_new = v
+
+Q = Q_SPECTRAL * np.array([
+    [DT**3 / 3, DT**2 / 2],
+    [DT**2 / 2, DT]
+])
+    # discrete process noise covariance for a white-noise-acceleration model
+
+R = np.array([[SIGMA_R**2]])    # measurement noise covariance (1x1 here, kept as a matrix so the algebra is general)
+
+
+
+# 2. Truth model
+
+def truth_range(x_true):
+    return np.sqrt(x_true[0]**2 + H_SENSOR**2)
+
+def simulate_truth(rng):
+    x_true = np.zeros((N_STEPS + 1, N_STATE))     # row k = true state at step k
+    z = np.zeros((N_STEPS + 1, N_MEAS))           # row k = measurement at step k (row 0 unused)
+    x_true[0] = X0_TRUE
+
+    for k in range(1, N_STEPS + 1):
+        w = rng.multivariate_normal(np.zeros(N_STATE), Q)   # random process noise kick
+        x_true[k] = F @ x_true[k - 1] + w                   # @ is matrix multiplication
+        v = rng.normal(0.0, SIGMA_R)                        # random sensor noise
+        z[k] = truth_range(x_true[k]) + v
+
+    return x_true, z
+
+
+
+# 3. Filter models
+
+def f_dyn(x):
+    return F @ x    # dynamics are linear here, so f(x) = F x
+
+def F_jac(x):
+    return F        # Jacobian of a linear function is just its matrix
+
+def h_meas(x):
+    return np.array([np.sqrt(x[0]**2 + H_SENSOR**2)])
+
+def H_jac(x):
+    r = np.sqrt(x[0]**2 + H_SENSOR**2)
+    return np.array([[x[0] / r, 0.0]])
+        # d(range)/d(position) = x/r, d(range)/d(velocity) = 0
+
+
+
+# 4. Extended Kalman filter
+
+def run_ekf(z, x_hat0):
+    x_hat = np.zeros((N_STEPS + 1, N_STATE))
+    P = np.zeros((N_STEPS + 1, N_STATE, N_STATE))     # one 2x2 covariance per step
+    nu = np.zeros((N_STEPS + 1, N_MEAS))              # innovation: measurement minus predicted measurement
+    S = np.zeros((N_STEPS + 1, N_MEAS, N_MEAS))       # innovation covariance
+
+    x_hat[0] = x_hat0
+    P[0] = P0
+    I = np.eye(N_STATE)
+
+    for k in range(1, N_STEPS + 1):
+        # Predict
+        x_pred = f_dyn(x_hat[k - 1])
+        Fk = F_jac(x_hat[k - 1])
+        P_pred = Fk @ P[k - 1] @ Fk.T + Q     # uncertainty grows by Q every step
+
+        # Update
+        Hk = H_jac(x_pred)                    # linearize the measurement at the predicted state
+        nu[k] = z[k] - h_meas(x_pred)
+        S[k] = Hk @ P_pred @ Hk.T + R         # how big the innovation *should* be
+        K = P_pred @ Hk.T @ np.linalg.inv(S[k])     # Kalman gain: trust in measurement vs. prediction
+        x_hat[k] = x_pred + K @ nu[k]
+        P[k] = (I - K @ Hk) @ P_pred @ (I - K @ Hk).T + K @ R @ K.T
+            # Joseph form of the covariance update - algebraically the same as (I - KH)P,
+            # but stays symmetric and positive definite under rounding error
+
+    return x_hat, P, nu, S
+
+
+
+# 5. Consistency statistics
+
+def normalized_squared(e, C):
+    return e @ np.linalg.solve(C, e)    # solve(C, e) = C^-1 e, without forming the inverse
+
+rng = np.random.default_rng(seed=1)     # fixed seed so results repeat run to run
+
+nees_all = np.zeros((N_RUNS, N_STEPS))
+nis_all = np.zeros((N_RUNS, N_STEPS))
+
+for run in range(N_RUNS):
+    x_true, z = simulate_truth(rng)
+    x_hat0 = X0_TRUE + rng.multivariate_normal(np.zeros(N_STATE), P0)
+        # initial estimate drawn FROM P0, so the starting error actually matches the stated uncertainty
+    x_hat, P, nu, S = run_ekf(z, x_hat0)
+
+    for k in range(1, N_STEPS + 1):
+        e = x_true[k] - x_hat[k]
+        nees_all[run, k - 1] = normalized_squared(e, P[k])
+        nis_all[run, k - 1] = normalized_squared(nu[k], S[k])
+
+    if run == 0:    # keep the first run for the 3-sigma error plots
+        err_run0 = x_true - x_hat
+        sig_run0 = np.sqrt(np.array([np.diag(Pk) for Pk in P]))     # 1-sigma from the diagonal of P
+
+nees_avg = nees_all.mean(axis=0)    # average across runs at each time step
+nis_avg = nis_all.mean(axis=0)
+
+nees_bounds = chi2.ppf([0.025, 0.975], N_RUNS * N_STATE) / N_RUNS
+nis_bounds = chi2.ppf([0.025, 0.975], N_RUNS * N_MEAS) / N_RUNS
+    # 95% two-sided acceptance region for the AVERAGED statistic
+
+nees_frac = np.mean((nees_avg > nees_bounds[0]) & (nees_avg < nees_bounds[1])) * 100
+nis_frac = np.mean((nis_avg > nis_bounds[0]) & (nis_avg < nis_bounds[1])) * 100
+print(f"Avg NEES = {nees_avg.mean():.2f} (expect {N_STATE}), inside bounds {nees_frac:.0f}% of steps (expect ~95%)")
+print(f"Avg NIS  = {nis_avg.mean():.2f} (expect {N_MEAS}), inside bounds {nis_frac:.0f}% of steps (expect ~95%)")
+
+
+
+# 6. Plot time!
+
+t = np.arange(N_STEPS + 1) * DT
+t_stats = t[1:]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), gridspec_kw={"hspace": 0.4, "wspace": 0.25})
+axes = axes.flatten()
+
+labels = ["Position error (m)", "Velocity error (m/s)"]
+for i in range(N_STATE):
+    ax = axes[i]
+    ax.plot(t, err_run0[:, i], color="blue", linewidth=1, label="truth - estimate")
+    ax.plot(t, 3 * sig_run0[:, i], color="red", linestyle="--", linewidth=1, label="±3σ")
+    ax.plot(t, -3 * sig_run0[:, i], color="red", linestyle="--", linewidth=1)
+    ax.set_title(f"{labels[i]}, run 1", fontsize=11)
+    ax.set_xlabel("t (s)", fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=7)
+
+stats = [
+    (axes[2], nees_avg, nees_bounds, f"Average NEES ({N_RUNS} runs)", N_STATE),
+    (axes[3], nis_avg, nis_bounds, f"Average NIS ({N_RUNS} runs)", N_MEAS),
+]
+for ax, values, bounds, title, dof in stats:
+    ax.plot(t_stats, values, color="blue", linewidth=1)
+    ax.axhline(bounds[0], color="red", linestyle="--", linewidth=1, label="95% bounds")
+    ax.axhline(bounds[1], color="red", linestyle="--", linewidth=1)
+    ax.axhline(dof, color="gray", linewidth=1, label=f"expected = {dof}")
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("t (s)", fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=7)
+
+plt.show()  # plot it
